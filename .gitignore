@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.env
+
+# Virtual environment
+venv/
+env/
+
+# SQLite database
+data/memories.db
+data/error.log
+
+# Models
+models/MiniLM/
+
+# IDE/project files
+.vscode/
+.idea/
+*.swp
+.DS_Store
