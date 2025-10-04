@@ -4,9 +4,10 @@ import json
 import sqlite3
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Query
+from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from typing import List, Optional
-from .config import DB_PATH, SIMILARITY_THRESHOLD, DEDUP_SIMILARITY_THRESHOLD, MAX_MEMORIES_PER_RECALL, MAX_TOKENS_PER_RECALL
+from .config import DB_PATH, SIMILARITY_THRESHOLD, DEDUP_SIMILARITY_THRESHOLD, MAX_MEMORIES_PER_RECALL, MAX_TOKENS_PER_RECALL, SIMILARITY_WEIGHT, IMPORTANCE_WEIGHT
 import asyncio
 from .embeddings import embed_text, cosine_sim, get_model
 import traceback
@@ -18,6 +19,19 @@ app = FastAPI(title="Bartender Memory (Phase 1)")
 base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 data_dir = os.path.join(base_dir, "data")
 os.makedirs(data_dir, exist_ok=True)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Warm up embedding model in background thread on startup
+    try:
+        await asyncio.to_thread(get_model)
+    except Exception:
+        pass
+    yield
+
+
+app.router.lifespan_context = lifespan
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -59,14 +73,7 @@ def init_db():
 init_db()
 
 
-@app.on_event("startup")
-async def startup_event():
-    # warm up the embedding model in a background thread so the first request isn't slow
-    try:
-        await asyncio.to_thread(get_model)
-    except Exception:
-        # don't crash the whole app on warmup failure; the first request will try again
-        pass
+# (startup warmup handled in lifespan above)
 
 # Pydantic models
 class RememberRequest(BaseModel):
@@ -219,12 +226,40 @@ async def recall(q: str = Query(..., description="Query text"), limit: int = Que
         })
     emb_matrix = np.vstack(emb_list)
     sims = cosine_sim(q_emb, emb_matrix)
-    # pair and sort
+    # pair
     pairs = list(zip(ids, texts, sims, meta))
-    # filter by threshold
+    # filter by similarity threshold first
     filtered = [p for p in pairs if p[2] >= SIMILARITY_THRESHOLD]
-    filtered.sort(key=lambda x: x[2], reverse=True)
-    selected = filtered[:limit]
+    if not filtered:
+        return {"results": []}
+
+    # normalize importance across filtered set to [0,1]
+    importances = []
+    for _, _, _, m in filtered:
+        try:
+            conn_local = get_conn()
+            cur_local = conn_local.cursor()
+            cur_local.execute("SELECT importance FROM memories WHERE id = ?", (m["id"],))
+            row_imp = cur_local.fetchone()
+            imp = float(row_imp[0]) if row_imp and row_imp[0] is not None else 0.0
+            importances.append(imp)
+            conn_local.close()
+        except Exception:
+            importances.append(0.0)
+    min_imp = min(importances) if importances else 0.0
+    max_imp = max(importances) if importances else 1.0
+    range_imp = max(1e-9, max_imp - min_imp)
+
+    scored = []
+    for (pid, text, sim, m), imp in zip(filtered, importances):
+        norm_imp = (imp - min_imp) / range_imp
+        combined = SIMILARITY_WEIGHT * sim + IMPORTANCE_WEIGHT * norm_imp
+        scored.append((pid, text, sim, imp, combined, m))
+
+    # sort by combined score desc
+    scored.sort(key=lambda x: x[4], reverse=True)
+    # take top-N by combined score
+    selected = [(pid, text, sim, m) for pid, text, sim, imp, combined, m in scored[:limit]]
 
     # enforce a conservative token budget by approximating tokens from word counts
     # approximate: 1 token ~= 0.75 words -> tokens = words / 0.75
@@ -344,3 +379,40 @@ def export_all():
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
     return {"exported_to": out_path}
+
+
+@app.put("/memory/{memory_id}/pin")
+def set_pin(memory_id: int, pinned: bool = Query(True, description="Set pinned=true or false")):
+    """Pin or unpin a memory. Pinned memories get a small importance boost in scoring."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE memories SET pinned = ? WHERE id = ?", (1 if pinned else 0, memory_id))
+    conn.commit()
+    conn.close()
+    return {"id": memory_id, "pinned": bool(pinned)}
+
+
+@app.get("/memory/{memory_id}/versions")
+def get_versions(memory_id: int):
+    """Return the version chain for a memory (walk previous_id links).
+    Returns a list ordered from latest -> earliest.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    chain = []
+    cur.execute("SELECT * FROM memories WHERE id = ?", (memory_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="memory not found")
+    # walk back
+    cur_row = row
+    while cur_row:
+        chain.append({k: cur_row[k] for k in cur_row.keys()})
+        prev = cur_row["previous_id"]
+        if not prev:
+            break
+        cur.execute("SELECT * FROM memories WHERE id = ?", (prev,))
+        cur_row = cur.fetchone()
+    conn.close()
+    return {"chain": chain}
