@@ -8,10 +8,12 @@ from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from typing import List, Optional
 from .config import DB_PATH, SIMILARITY_THRESHOLD, DEDUP_SIMILARITY_THRESHOLD, MAX_MEMORIES_PER_RECALL, MAX_TOKENS_PER_RECALL, SIMILARITY_WEIGHT, IMPORTANCE_WEIGHT
+from .config import BACKEND_PROVIDER, OLLAMA_URL, OPENROUTER_URL, OPENROUTER_API_KEY
 import asyncio
 from .embeddings import embed_text, cosine_sim, get_model
 import traceback
 import numpy as np
+import httpx
 
 app = FastAPI(title="Bartender Memory (Phase 1)")
 
@@ -32,6 +34,82 @@ async def lifespan(app: FastAPI):
 
 
 app.router.lifespan_context = lifespan
+
+
+# Approximate token count estimator (module-level so it can be reused/mocked)
+def approx_tokens(text: str) -> int:
+    words = len(text.split()) if text else 0
+    return int(words / 0.75)
+
+
+async def call_ollama(messages, model="qwen2.5:3b", max_tokens: int | None = None):
+    # Ollama's chat completion API expects {model, messages}
+    url = f"{OLLAMA_URL}/api/generate"
+    payload = {"model": model, "messages": messages}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(url, json=payload)
+        r.raise_for_status()
+        return r.json()
+
+
+async def call_openrouter(messages, model="gpt-4o-mini", max_tokens: int | None = None):
+    url = f"{OPENROUTER_URL}/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}"} if OPENROUTER_API_KEY else {}
+    payload = {"model": model, "messages": messages}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(url, json=payload, headers=headers)
+        r.raise_for_status()
+        return r.json()
+
+
+def map_backend_to_openai(backend_resp) -> dict:
+    # If backend already returns OpenAI-like, return directly
+    if isinstance(backend_resp, dict) and backend_resp.get("choices"):
+        return backend_resp
+    out = {"id": backend_resp.get("id", ""), "object": "chat.completion", "choices": [], "usage": {}}
+    choices = backend_resp.get("choices") or []
+    for ch in choices:
+        msg = ch.get("message") or ch.get("content") or {}
+        if isinstance(msg, dict):
+            content = msg.get("content") or ""
+            role = msg.get("role", "assistant")
+        else:
+            content = str(msg)
+            role = "assistant"
+        out["choices"].append({"message": {"role": role, "content": content}, "finish_reason": ch.get("finish_reason") or "stop"})
+    return out
+
+
+def recompute_importance_for_id(memory_id: int):
+    """Recompute importance for a single memory id using the same formula used in recall.
+    importance = times_recalled*0.4 + recency_bonus*0.3 + llm_weight*0.2 + pinned*0.1
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT times_recalled, created_at, pinned, llm_weight FROM memories WHERE id = ?", (memory_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return
+    try:
+        times_recalled = int(row[0] or 0)
+    except Exception:
+        times_recalled = 0
+    created_at = row[1]
+    recency_bonus = 1.0
+    try:
+        if created_at:
+            created_dt = datetime.fromisoformat(created_at.replace("Z", ""))
+            age_days = max((datetime.utcnow() - created_dt).days, 0)
+            recency_bonus = max(0.1, 1.0 - (age_days / 365.0))
+    except Exception:
+        recency_bonus = 1.0
+    pinned = int(row[2] or 0)
+    llm_weight = float(row[3] or 1.0)
+    importance = (times_recalled * 0.4) + (recency_bonus * 0.3) + (llm_weight * 0.2) + (pinned * 0.1)
+    cur.execute("UPDATE memories SET importance = ? WHERE id = ?", (importance, memory_id))
+    conn.commit()
+    conn.close()
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -262,11 +340,6 @@ async def recall(q: str = Query(..., description="Query text"), limit: int = Que
     selected = [(pid, text, sim, m) for pid, text, sim, imp, combined, m in scored[:limit]]
 
     # enforce a conservative token budget by approximating tokens from word counts
-    # approximate: 1 token ~= 0.75 words -> tokens = words / 0.75
-    def approx_tokens(text: str) -> int:
-        words = len(text.split()) if text else 0
-        return int(words / 0.75)  # conservative (overestimates slightly)
-
     total_tokens = sum(approx_tokens(t) for _, t, _, _ in selected)
     truncated_by_token_budget = False
     # trim lowest-similarity items until under the token budget
@@ -307,6 +380,89 @@ async def recall(q: str = Query(..., description="Query text"), limit: int = Que
     results = [{"id": pid, "text": text, "score": float(score)} for pid, text, score, _ in selected]
     conn.close()
     return {"results": results}
+
+
+@app.post("/v1/embeddings")
+async def v1_embeddings(body: dict):
+    # minimal OpenAI embeddings compatibility: accepts {input: "..."}
+    inp = body.get("input") or body.get("inputs")
+    if not inp:
+        raise HTTPException(status_code=400, detail="no input provided")
+    # support list or single
+    if isinstance(inp, list):
+        embs = [await asyncio.to_thread(embed_text, str(i)) for i in inp]
+        return {"data": [{"embedding": e.tolist()} for e in embs]}
+    e = await asyncio.to_thread(embed_text, str(inp))
+    return {"data": [{"embedding": e.tolist()}]}
+
+
+@app.post("/v1/chat/completions")
+async def v1_chat_completions(body: dict):
+    """OpenAI-compatible chat completions proxy that injects memories as a system message.
+
+    Expected body shape (OpenAI-like): {model, messages: [{role, content}, ...], max_tokens, temperature}
+    """
+    model = body.get("model")
+    messages = body.get("messages") or []
+    max_tokens = body.get("max_tokens")
+
+    # find the latest user message to use as recall query
+    latest_user = None
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            latest_user = m.get("content")
+            break
+    if not latest_user:
+        raise HTTPException(status_code=400, detail="no user message found in messages")
+
+    # query local recall endpoint functionally (call recall logic directly to avoid HTTP roundtrip)
+    # We can reuse internal recall: call with stripped q and configured limit
+    recall_limit = min(body.get("n") or body.get("limit") or MAX_MEMORIES_PER_RECALL, MAX_MEMORIES_PER_RECALL)
+    # use the same recall function by invoking embed/DB logic directly
+    recall_resp = await recall(q=latest_user, limit=recall_limit)
+    included = recall_resp.get("results", [])
+
+    # Build injected system message with token budget enforcement
+    injected_texts = []
+    tokens_used = 0
+    for item in included:
+        t = item.get("text")
+        tok = approx_tokens(t)
+        if tokens_used + tok > MAX_TOKENS_PER_RECALL:
+            break
+        injected_texts.append(f"MEMORY: {t}")
+        tokens_used += tok
+
+    if injected_texts:
+        system_message = {"role": "system", "content": "\n\n".join(injected_texts)}
+        # Prepend system message to a copy of messages
+        messages_with_memory = [system_message] + messages
+    else:
+        messages_with_memory = messages
+
+    # Forward to configured backend
+    backend_resp = None
+    if BACKEND_PROVIDER == "ollama":
+        try:
+            backend_resp = await call_ollama(messages_with_memory, model=model, max_tokens=max_tokens)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e))
+    elif BACKEND_PROVIDER == "openrouter":
+        try:
+            backend_resp = await call_openrouter(messages_with_memory, model=model, max_tokens=max_tokens)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e))
+    else:
+        raise HTTPException(status_code=500, detail=f"unsupported backend: {BACKEND_PROVIDER}")
+
+    # Map backend response into OpenAI-like shape
+    mapped = map_backend_to_openai(backend_resp)
+
+    # Add debug info about included memories
+    mapped.setdefault("_bartender", {})
+    mapped["_bartender"]["memories_injected"] = [ {"id": it.get("id"), "score": it.get("score") } for it in included ]
+
+    return mapped
 
 
 @app.get("/health")
@@ -389,6 +545,11 @@ def set_pin(memory_id: int, pinned: bool = Query(True, description="Set pinned=t
     cur.execute("UPDATE memories SET pinned = ? WHERE id = ?", (1 if pinned else 0, memory_id))
     conn.commit()
     conn.close()
+    # recompute importance now that pinned changed
+    try:
+        recompute_importance_for_id(memory_id)
+    except Exception:
+        pass
     return {"id": memory_id, "pinned": bool(pinned)}
 
 
