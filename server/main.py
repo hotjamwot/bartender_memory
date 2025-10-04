@@ -6,7 +6,7 @@ from datetime import datetime
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from typing import List, Optional
-from .config import DB_PATH, SIMILARITY_THRESHOLD, DEDUP_SIMILARITY_THRESHOLD, MAX_MEMORIES_PER_RECALL
+from .config import DB_PATH, SIMILARITY_THRESHOLD, DEDUP_SIMILARITY_THRESHOLD, MAX_MEMORIES_PER_RECALL, MAX_TOKENS_PER_RECALL
 import asyncio
 from .embeddings import embed_text, cosine_sim, get_model
 import traceback
@@ -172,7 +172,23 @@ async def recall(q: str = Query(..., description="Query text"), limit: int = Que
     filtered = [p for p in pairs if p[2] >= SIMILARITY_THRESHOLD]
     filtered.sort(key=lambda x: x[2], reverse=True)
     selected = filtered[:limit]
-    # increment times_recalled
+
+    # enforce a conservative token budget by approximating tokens from word counts
+    # approximate: 1 token ~= 0.75 words -> tokens = words / 0.75
+    def approx_tokens(text: str) -> int:
+        words = len(text.split()) if text else 0
+        return int(words / 0.75)  # conservative (overestimates slightly)
+
+    total_tokens = sum(approx_tokens(t) for _, t, _, _ in selected)
+    truncated_by_token_budget = False
+    # trim lowest-similarity items until under the token budget
+    while total_tokens > MAX_TOKENS_PER_RECALL and len(selected) > 0:
+        truncated_by_token_budget = True
+        # drop the last (lowest similarity) entry
+        pid, text, score, m = selected.pop()
+        total_tokens = sum(approx_tokens(t) for _, t, _, _ in selected)
+
+    # increment times_recalled for the final selected set
     for pid, _, score, m in selected:
         cur.execute("UPDATE memories SET times_recalled = times_recalled + 1 WHERE id = ?", (pid,))
     conn.commit()
