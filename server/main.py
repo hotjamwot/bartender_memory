@@ -38,9 +38,21 @@ def init_db():
         deprecated INTEGER DEFAULT 0,
         version INTEGER DEFAULT 1,
         previous_id INTEGER DEFAULT NULL,
-        times_recalled INTEGER DEFAULT 0
+        times_recalled INTEGER DEFAULT 0,
+        importance REAL DEFAULT 0.0,
+        pinned INTEGER DEFAULT 0,
+        llm_weight REAL DEFAULT 1.0
     )
     """)
+    # Migration-safe: ensure new columns exist if this DB was created earlier
+    cur.execute("PRAGMA table_info(memories)")
+    cols = {r[1] for r in cur.fetchall()}  # second column is name
+    if 'importance' not in cols:
+        cur.execute("ALTER TABLE memories ADD COLUMN importance REAL DEFAULT 0.0")
+    if 'pinned' not in cols:
+        cur.execute("ALTER TABLE memories ADD COLUMN pinned INTEGER DEFAULT 0")
+    if 'llm_weight' not in cols:
+        cur.execute("ALTER TABLE memories ADD COLUMN llm_weight REAL DEFAULT 1.0")
     conn.commit()
     conn.close()
 
@@ -71,6 +83,20 @@ async def remember(req: RememberRequest):
         # main logic follows
         text = req.text.strip()
         tags = ",".join(req.tags) if req.tags else None
+        # extract simple flags from tags (e.g. priority:high -> pinned/llm_weight)
+        pinned = 0
+        llm_weight = 1.0
+        if req.tags:
+            for t in req.tags:
+                if isinstance(t, str) and t.lower() == "pinned":
+                    pinned = 1
+                if isinstance(t, str) and t.startswith("priority:"):
+                    # priority:high -> increase weight
+                    p = t.split(":", 1)[1].lower()
+                    if p == "high":
+                        llm_weight = 2.0
+                    elif p == "low":
+                        llm_weight = 0.5
 
         # embed (offload to thread so we don't block the event loop)
         emb = await asyncio.to_thread(embed_text, text)
@@ -110,20 +136,34 @@ async def remember(req: RememberRequest):
             cur.execute("SELECT text FROM memories WHERE id = ?", (best_id,))
             prev_text = cur.fetchone()["text"]
             merged_text = prev_text + "\n\n[Merged " + now + "]: " + text
+            # determine version number: previous version + 1
+            cur.execute("SELECT version FROM memories WHERE id = ?", (best_id,))
+            try:
+                prev_version = int(cur.fetchone()["version"] or 1)
+            except Exception:
+                prev_version = 1
+            version = prev_version + 1
+            # compute a simple importance score. Phase1 uses recall frequency and recency.
+            # recency_bonus: newer items get higher recency (in days inverse)
+            recency_bonus = 1.0  # default for new merged entry
+            importance = (0.0 * 0.4) + (recency_bonus * 0.3) + (llm_weight * 0.2) + (pinned * 0.1)
             cur.execute("""
-                INSERT INTO memories (text, embedding, tags, created_at, updated_at, previous_id, version)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (merged_text, json.dumps(emb_list), tags, now, now, best_id, 1))
+                INSERT INTO memories (text, embedding, tags, created_at, updated_at, previous_id, version, pinned, llm_weight, importance)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (merged_text, json.dumps(emb_list), tags, now, now, best_id, version, pinned, llm_weight, importance))
             new_id = cur.lastrowid
             conn.commit()
             conn.close()
             return {"status":"merged", "new_id": new_id, "previous_id": best_id, "similarity": best_sim}
         else:
             # insert as new
+            # initial importance computation for a fresh memory
+            recency_bonus = 1.0
+            importance = (0.0 * 0.4) + (recency_bonus * 0.3) + (llm_weight * 0.2) + (pinned * 0.1)
             cur.execute("""
-                INSERT INTO memories (text, embedding, tags, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-            """, (text, json.dumps(emb_list), tags, now, now))
+                INSERT INTO memories (text, embedding, tags, created_at, updated_at, pinned, llm_weight, importance)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (text, json.dumps(emb_list), tags, now, now, pinned, llm_weight, importance))
             new_id = cur.lastrowid
             conn.commit()
             conn.close()
@@ -145,7 +185,7 @@ async def recall(q: str = Query(..., description="Query text"), limit: int = Que
     q_emb = await asyncio.to_thread(embed_text, q)
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT id, text, embedding, tags, times_recalled FROM memories WHERE deprecated=0")
+    cur.execute("SELECT id, text, embedding, tags, times_recalled, created_at, updated_at, pinned, llm_weight FROM memories WHERE deprecated=0")
     rows = cur.fetchall()
     if not rows:
         return {"results": []}
@@ -163,7 +203,20 @@ async def recall(q: str = Query(..., description="Query text"), limit: int = Que
         except Exception:
             arr = np.zeros_like(q_emb)
         emb_list.append(arr)
-        meta.append({"id": r["id"], "tags": r["tags"], "times_recalled": r["times_recalled"]})
+        # sqlite3.Row doesn't have .get(); access by key and provide defaults
+        created_at = r["created_at"] if "created_at" in r.keys() else None
+        updated_at = r["updated_at"] if "updated_at" in r.keys() else None
+        pinned_val = int(r["pinned"] if "pinned" in r.keys() and r["pinned"] is not None else 0)
+        llm_w = float(r["llm_weight"] if "llm_weight" in r.keys() and r["llm_weight"] is not None else 1.0)
+        meta.append({
+            "id": r["id"],
+            "tags": r["tags"],
+            "times_recalled": r["times_recalled"],
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "pinned": pinned_val,
+            "llm_weight": llm_w
+        })
     emb_matrix = np.vstack(emb_list)
     sims = cosine_sim(q_emb, emb_matrix)
     # pair and sort
@@ -188,12 +241,36 @@ async def recall(q: str = Query(..., description="Query text"), limit: int = Que
         pid, text, score, m = selected.pop()
         total_tokens = sum(approx_tokens(t) for _, t, _, _ in selected)
 
-    # increment times_recalled for the final selected set
+    # increment times_recalled for the final selected set and recompute importance
     for pid, _, score, m in selected:
         cur.execute("UPDATE memories SET times_recalled = times_recalled + 1 WHERE id = ?", (pid,))
+        # recompute importance using the formula (phase1 approximated):
+        # importance = recall_freq*0.4 + recency_bonus*0.3 + llm_weight*0.2 + pinned*0.1
+        cur.execute("SELECT times_recalled, created_at, updated_at, pinned, llm_weight FROM memories WHERE id = ?", (pid,))
+        row = cur.fetchone()
+        try:
+            times_recalled = int(row[0] or 0)
+        except Exception:
+            times_recalled = 0
+        created_at = row[1]
+        # compute recency bonus: newer items score higher; recency in days inverse
+        recency_bonus = 1.0
+        try:
+            if created_at:
+                created_dt = datetime.fromisoformat(created_at.replace("Z", ""))
+                age_days = max((datetime.utcnow() - created_dt).days, 0)
+                # more recent => higher bonus (we invert and cap)
+                recency_bonus = max(0.1, 1.0 - (age_days / 365.0))
+        except Exception:
+            recency_bonus = 1.0
+        pinned = int(row[3] or 0)
+        llm_weight = float(row[4] or 1.0)
+        importance = (times_recalled * 0.4) + (recency_bonus * 0.3) + (llm_weight * 0.2) + (pinned * 0.1)
+        cur.execute("UPDATE memories SET importance = ? WHERE id = ?", (importance, pid))
     conn.commit()
-    conn.close()
+    # return results
     results = [{"id": pid, "text": text, "score": float(score)} for pid, text, score, _ in selected]
+    conn.close()
     return {"results": results}
 
 
