@@ -208,3 +208,55 @@ def test_version_chain_on_merge(tmp_path, monkeypatch):
         # chain should contain at least two entries including the previous id
         ids = [c["id"] for c in chain]
         assert mid in ids and new_id in ids
+
+
+def test_cherry_studio_payload_normalization(tmp_path, monkeypatch):
+    """Cherry Studio sometimes sends non-OpenAI shapes (nested content/parts).
+    Ensure our endpoint accepts these and normalizes into OpenAI-like messages.
+    """
+    # Setup temp DB
+    get_conn_override = setup_temp_db(tmp_path)
+    monkeypatch.setattr(main, "get_conn", get_conn_override)
+
+    # embed stub: anything -> [0,1]
+    def embed_stub(text: str):
+        return np.array([0.0, 1.0], dtype=np.float32)
+
+    monkeypatch.setattr(main, "embed_text", embed_stub)
+    main.init_db()
+
+    captured = {}
+
+    async def fake_call_ollama(messages, model=None, max_tokens=None):
+        captured["messages"] = messages
+        return {"id": "fake", "choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    monkeypatch.setattr(main, "call_ollama", fake_call_ollama)
+    monkeypatch.setattr(main, "BACKEND_PROVIDER", "ollama")
+
+    client = TestClient(main.app)
+
+    # Example Cherry-like payload: messages is a list of dicts with nested content.parts
+    cherry_payload = {
+        "model": "qwen2.5:3b",
+        "messages": [
+            {"author": "user", "content": {"type": "text", "parts": ["Hello from Cherry"]}},
+            {"author": {"role": "user"}, "content": {"text": "Second message"}},
+        ],
+    }
+
+    r = client.post("/v1/chat/completions", json=cherry_payload)
+    assert r.status_code == 200
+    data = r.json()
+    # backend should receive normalized messages list
+    assert "messages" in captured
+    msgs = captured["messages"]
+    assert isinstance(msgs, list)
+    # first message should be a system message injected (memories may be empty) or the user message
+    # ensure at least one message has role 'user' and expected content
+    user_texts = [m.get("content") for m in msgs if m.get("role") == "user"]
+    assert any("Hello from Cherry" in (t or "") for t in user_texts)
+    assert any("Second message" in (t or "") for t in user_texts)
+    # response normalization
+    assert data.get("choices")
+    assert data["choices"][0]["message"]["content"] == "ok"

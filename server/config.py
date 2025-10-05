@@ -31,3 +31,10 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 # OpenRouter settings (if using OpenRouter)
 OPENROUTER_URL = os.environ.get("OPENROUTER_URL", "https://api.openrouter.ai/v1")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+
+# How long to cache probed model lists (seconds)
+MODELS_CACHE_TTL_SECONDS = int(os.environ.get("BARTENDER_MODELS_TTL", "30"))
+
+# Ollama warm-on-demand settings
+OLLAMA_WARM_MAX_ATTEMPTS = int(os.environ.get("BARTENDER_OLLAMA_WARM_MAX_ATTEMPTS", "6"))
+OLLAMA_WARM_BASE_WAIT = float(os.environ.get("BARTENDER_OLLAMA_WARM_BASE_WAIT", "1.0"))
